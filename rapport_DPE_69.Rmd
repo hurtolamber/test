@@ -1,0 +1,275 @@
+---
+title: "Étude des Performances Énergétiques des Logements - Département 69"
+author: "Leonard"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: lumen
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    css: "www/R_Markdown.css"
+---
+
+# Introduction
+
+<div class="introduction">
+La transition énergétique est un enjeu crucial pour la lutte contre le changement climatique. Les bâtiments résidentiels jouent un rôle clé dans cette transition, et leur performance énergétique est mesurée à travers le Diagnostic de Performance Énergétique (DPE). Le DPE évalue l'efficacité énergétique des logements sur une échelle de A (très performant) à G (peu performant).
+
+Cette étude se concentre sur l'analyse des logements <b>neufs</b> et <b>anciens</b> du département <b>69 (Rhône)</b>. L'objectif est d'examiner les différences de performances énergétiques entre ces deux types de logements, ainsi que d'analyser les corrélations entre les coûts énergétiques et d'autres variables telles que la <b>surface habitable</b>. En identifiant les zones d'amélioration potentielles, cette étude vise à proposer des recommandations pertinentes pour favoriser des pratiques de construction plus durables et énergétiquement efficaces.
+</div>
+
+## Objectifs de l'étude
+
+<div class="objectives">
+Les principaux objectifs de cette analyse sont :
+
+1. <b>Identifier les tendances énergétiques des logements</b> en fonction de l'étiquette DPE.  
+2. <b>Explorer les corrélations</b> entre les coûts énergétiques, la surface habitable, et d'autres variables clés.  
+3. <b>Proposer des recommandations</b> en matière de politiques publiques ou de réhabilitation énergétique.
+</div>
+
+---
+
+# Données et Méthodologie
+
+<div class="methodology">
+Les données utilisées proviennent de l'API ADEME (jeux <i>dpe03existant</i> et <i>dpe02neuf</i>), au <b>format snake_case</b> : <code>numero_dpe</code>, <code>etiquette_dpe</code>, <code>date_reception_dpe</code>, <code>code_postal_ban</code>, <code>surface_habitable_logement</code>, <code>cout_chauffage</code>, <code>coordonnee_cartographique_x_ban</code>, <code>coordonnee_cartographique_y_ban</code>, etc.  
+Deux stratégies sont prévues : (1) charger un <b>CSV cache</b> s'il existe, ou (2) interroger l'API pour une exécution one-shot.
+</div>
+
+## Importation et Préparation des Données
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# ---- Packages ----
+library(dplyr)
+library(ggplot2)
+library(leaflet)
+library(corrplot)
+library(httr)
+library(jsonlite)
+library(sf)
+library(readr)
+library(knitr)
+library(stringr)
+
+# ---- Paramètres ----
+CACHE_PATH <- "data/dpe_cache.csv"   # CSV anci+neuf
+dir.create("data", showWarnings = FALSE, recursive = TRUE)
+
+# ---- Utils : conversion Lambert93 -> WGS84 ----
+convert_lambert93_to_wgs84 <- function(x, y) {
+  x <- suppressWarnings(as.numeric(x))
+  y <- suppressWarnings(as.numeric(y))
+  ok <- !is.na(x) & !is.na(y)
+  if (!any(ok)) return(data.frame(lon = rep(NA_real_, length(x)), lat = rep(NA_real_, length(y))))
+  pts <- data.frame(x = x[ok], y = y[ok])
+  sf_pts <- st_as_sf(pts, coords = c("x", "y"), crs = 2154)
+  sf_pts <- st_transform(sf_pts, 4326)
+  coords <- st_coordinates(sf_pts)
+  out <- data.frame(lon = rep(NA_real_, length(x)), lat = rep(NA_real_, length(y)))
+  out$lon[ok] <- coords[,1]
+  out$lat[ok] <- coords[,2]
+  out
+}
+
+ensure_col <- function(df, col) { if (!col %in% names(df)) df[[col]] <- NA; df }
+
+# ---- API generic fetch with pagination ----
+fetch_ademe <- function(base_url, page_size = 10000) {
+  all_data <- list(); page <- 1L
+  repeat {
+    params <- list(
+      page   = page,
+      size   = page_size,
+      select = paste(c(
+        "numero_dpe","etiquette_dpe","date_reception_dpe","code_postal_ban",
+        "coordonnee_cartographique_x_ban","coordonnee_cartographique_y_ban",
+        "surface_habitable_logement","cout_chauffage","typologie_logement",
+        "type_batiment","nom_commune_ban","code_departement_ban"
+      ), collapse = ","),
+      q        = "69*",
+      q_fields = "code_postal_ban"
+    )
+    url <- httr::modify_url(base_url, query = params)
+    res <- try(httr::GET(url), silent = TRUE)
+    if (inherits(res, "try-error") || httr::status_code(res) != 200) break
+    txt <- httr::content(res, as = "text", encoding = "UTF-8")
+    result <- jsonlite::fromJSON(txt)$result
+    if (is.null(result) || !is.data.frame(result) || nrow(result) == 0) break
+    all_data[[length(all_data) + 1L]] <- result
+    if (nrow(result) < page_size) break
+    page <- page + 1L
+  }
+  if (length(all_data) == 0) return(data.frame())
+  dplyr::bind_rows(all_data)
+}
+
+get_data_69_existants <- function() {
+  fetch_ademe("https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines", page_size = 10000)
+}
+get_data_69_neufs <- function() {
+  fetch_ademe("https://data.ademe.fr/data-fair/api/v1/datasets/dpe02neuf/lines", page_size = 10000)
+}
+
+# ---- Chargement : CSV si dispo sinon API ----
+if (file.exists(CACHE_PATH)) {
+  merged_data <- suppressWarnings(readr::read_csv(CACHE_PATH, show_col_types = FALSE))
+} else {
+  ex <- get_data_69_existants()
+  ne <- get_data_69_neufs()
+  ex$Logement <- "ancien"; ne$Logement <- "neuf"
+
+  needed <- c("numero_dpe","etiquette_dpe","date_reception_dpe","code_postal_ban",
+              "surface_habitable_logement","cout_chauffage",
+              "coordonnee_cartographique_x_ban","coordonnee_cartographique_y_ban",
+              "typologie_logement","type_batiment","nom_commune_ban","code_departement_ban","Logement")
+  for (nm in needed) { ex <- ensure_col(ex, nm); ne <- ensure_col(ne, nm) }
+
+  common <- intersect(names(ex), names(ne))
+  merged_data <- dplyr::bind_rows(ex[, common], ne[, common])
+
+  # coords
+  coords <- convert_lambert93_to_wgs84(merged_data$coordonnee_cartographique_x_ban,
+                                       merged_data$coordonnee_cartographique_y_ban)
+  merged_data$lon <- coords$lon; merged_data$lat <- coords$lat
+
+  # types
+  suppressWarnings({
+    merged_data$surface_habitable_logement <- as.numeric(merged_data$surface_habitable_logement)
+    merged_data$cout_chauffage             <- as.numeric(merged_data$cout_chauffage)
+    merged_data$date_reception_dpe         <- as.Date(merged_data$date_reception_dpe)
+  })
+
+  # dédoublonnage
+  if ("numero_dpe" %in% names(merged_data)) {
+    merged_data <- merged_data |> arrange(desc(date_reception_dpe)) |> distinct(numero_dpe, .keep_all = TRUE)
+  }
+
+  # Sauvegarde cache pour la prochaine fois
+  readr::write_csv(merged_data, CACHE_PATH)
+}
+
+# Aperçu
+head(merged_data)
+```
+
+# Synthèse des Indicateurs Clés de Performance (KPI)
+
+<div class="kpi-section">
+Les indicateurs clés de performance (KPI) suivants fournissent une vue d'ensemble des logements dans le département 69. Ils incluent le <b>nombre total</b> de logements, la part <b>ancien/neuf</b>, et l'<b>étiquette DPE</b> la plus fréquente.
+</div>
+
+```{r kpi, echo=FALSE}
+context_data <- function(df) {
+  total_logements <- nrow(df)
+  pct_anciens <- if (total_logements > 0) round(100 * mean(df$Logement == "ancien", na.rm = TRUE), 1) else 0
+  pct_neufs   <- if (total_logements > 0) round(100 * mean(df$Logement == "neuf",   na.rm = TRUE), 1) else 0
+  categorie_majoritaire <- if (total_logements > 0 && "etiquette_dpe" %in% names(df)) {
+    df |> count(etiquette_dpe, sort = TRUE) |> slice(1) |> pull(etiquette_dpe)
+  } else "Aucune"
+  list(total_logements = total_logements,
+       pct_anciens = pct_anciens,
+       pct_neufs   = pct_neufs,
+       categorie_majoritaire = categorie_majoritaire)
+}
+k <- context_data(merged_data)
+kable(data.frame(
+  Indicateurs = c("Total de logements",
+                  "Pourcentage de logements anciens",
+                  "Pourcentage de logements neufs",
+                  "Catégorie DPE majoritaire"),
+  Valeurs = c(k$total_logements,
+              paste0(k$pct_anciens, " %"),
+              paste0(k$pct_neufs, " %"),
+              k$categorie_majoritaire)
+), caption = "KPI synthétiques sur le département 69", align = "c")
+```
+
+# Analyse des Performances Énergétiques
+
+<div class="energy-analysis">
+Nous analysons les performances en fonction de l'étiquette DPE, du type de logement et des grandeurs quantitatives (surface, coût).
+</div>
+
+## Répartition des coûts de chauffage selon l'étiquette DPE
+
+![Coût du chauffage selon l'étiquette DPE](https://www.hebergeur-image.fr/uploads/20241014/4223c89241621638843dc335bc67816b5f1af683.png)
+
+**Analyse :** Les coûts sont plus élevés pour les classes F et G. Les logements neufs restent globalement plus efficaces, mais des cas extrêmes subsistent.
+
+## Corrélation entre surface habitable et coût du chauffage
+
+```{r correlation_plot, echo=FALSE, message=FALSE, warning=FALSE}
+df_cor <- merged_data |>
+  transmute(surface_habitable_logement = as.numeric(surface_habitable_logement),
+            cout_chauffage             = as.numeric(cout_chauffage)) |>
+  na.omit()
+if (nrow(df_cor) > 2) {
+  mat <- cor(df_cor, use = "complete.obs")
+  corrplot(mat, method = "circle", tl.col = "black", tl.srt = 45,
+           title = "Corrélogramme surface vs coût", mar = c(0,0,1,0))
+}
+```
+
+**Lecture :** Corrélation <b>positive</b> attendue : plus la surface augmente, plus le coût tend à croître — avec une dispersion liée à l’isolation, au chauffage et aux usages.
+
+# Visualisation Géographique
+
+```{r leaflet_map, echo=FALSE, message=FALSE, warning=FALSE}
+df_map <- merged_data
+df_map$lon <- suppressWarnings(as.numeric(df_map$lon))
+df_map$lat <- suppressWarnings(as.numeric(df_map$lat))
+df_valid <- df_map[!is.na(df_map$lon) & !is.na(df_map$lat), ]
+if (nrow(df_valid) > 0) {
+  leaflet(df_valid) |>
+    addTiles() |>
+    setView(lng = 4.85, lat = 45.75, zoom = 9) |>
+    addCircleMarkers(
+      lng = ~lon, lat = ~lat,
+      color = ~ifelse(Logement == "ancien", "#E69F00", "#56B4E9"),
+      popup = ~paste("<strong>Étiquette DPE:</strong>", etiquette_dpe,
+                     "<br><strong>Coût chauffage:</strong>", cout_chauffage,
+                     "€<br><strong>Surface:</strong>", surface_habitable_logement, "m²",
+                     "<br><strong>Type:</strong>", Logement),
+      radius = 5, fillOpacity = 0.7, stroke = FALSE,
+      clusterOptions = markerClusterOptions()
+    )
+}
+```
+
+# Deux Problématiques Ciblées
+
+## Quels logements nécessitent le plus de rénovation ?
+
+```{r renovation_analysis, echo=FALSE}
+logements_fg <- merged_data |> filter(etiquette_dpe %in% c("F","G")) |> count(Logement, name = "nb")
+kable(logements_fg, caption = "Logements classés F et G par type", align = "c")
+```
+
+**Interprétation :** Les **anciens** sont surreprésentés parmi F/G ⇒ cibles prioritaires des aides à la rénovation.
+
+## Les neufs sont-ils systématiquement plus économiques ?
+
+```{r cost_distribution, echo=FALSE}
+ggplot(merged_data, aes(x = Logement, y = as.numeric(cout_chauffage), fill = Logement)) +
+  geom_violin(trim = FALSE, na.rm = TRUE) +
+  coord_cartesian(ylim = c(0, 5000)) +
+  labs(title = "Distribution des coûts de chauffage par type",
+       x = "Type de logement", y = "Coût (€)") +
+  theme_minimal() +
+  scale_fill_manual(values = c("ancien" = "#E69F00", "neuf" = "#56B4E9"))
+```
+
+**Conclusion partielle :** Les **neufs** affichent une distribution plus resserrée et des médianes plus basses, mais des outliers existent.
+
+# Conclusion
+
+<div class="conclusion">
+- Les classes <b>F/G</b> concentrent les coûts élevés ⇒ priorité aux rénovations ciblées.<br>
+- Une corrélation <b>surface ↗ / coût ↗</b> est observée, modulée par l’isolation et les systèmes installés.<br>
+- La carte met en évidence des <b>foyers géographiques</b> utiles pour prioriser les actions locales.<br>
+- Les <b>logements neufs</b> sont globalement plus sobres, mais l’hétérogénéité appelle à des contrôles qualité soutenus.
+</div>
